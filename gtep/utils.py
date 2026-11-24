@@ -152,6 +152,36 @@ def load_period_structure_from_json(period_structure_json_file):
 
     return period_dict
 
+def check_commitment_periods_match_duration(period_dict):
+    """This method checks that the number of commitment periods in
+    each representative period equals the representative period
+    duration in hours. GTEP currently indexes time-series data by
+    commitment period (one hourly data point per commitment period),
+    so commitment periods must be one hour long. It raises ValueError
+    with details if mismatches are found.
+
+    [TODO: Remove this restriction once time-series data are mapped
+    to commitment/dispatch periods by time offset.]
+    """
+
+    errors = []
+    for rep, rep_duration in period_dict["duration_representative_period"].items():
+        n_commit = period_dict["number_commitment"][rep]
+        if n_commit != rep_duration:
+            errors.append(
+                f"  - Representative period {rep}: "
+                f"number of commitment periods ({n_commit}) "
+                f"!= representative period duration ({rep_duration} hr)"
+            )
+
+    if errors:
+        raise ValueError(
+            "The number of commitment periods must equal the representative "
+            "period duration in hours. GTEP currently requires one-hour "
+            "commitment periods because time-series data are indexed by "
+            "commitment period:\n" + "\n".join(errors)
+        )
+
 
 def check_period_structure_consistency(period_dict):
     """This method checks that the sum of commitment and dispatch

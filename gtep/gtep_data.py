@@ -72,6 +72,8 @@ class ExpansionPlanningData:
         representative_weights: dict | None = None,
         options_dict: dict | None = None,
         start_date=None,
+        apply_weights_to_full_year: bool = True,
+        hours_per_year: float = 8760,
     ):
         """
         Loads data structured via Prescient data loader.
@@ -86,9 +88,9 @@ class ExpansionPlanningData:
                                             the given run(s).
         :param representative_weights:  Weight for each representative date, in the format
                                             `{date: weight}`. Every representative date must
-                                            be an element
-                                            of `representative_weights.keys()`. Furthermore, the
-                                            weights must sum to 365. Defaults to `None`,
+                                            be an element of `representative_weights.keys()`.
+                                            How the weights are interpreted depends on
+                                            `apply_weights_to_full_year`. Defaults to `None`,
                                             in which case all representative dates are
                                             given equal weight.
         :param options_dict:            Arguments to be passed to the Prescient data
@@ -99,12 +101,55 @@ class ExpansionPlanningData:
                                             provided, this is read from
                                             simulation_objects.csv using the Date_From
                                             row and DAY_AHEAD column, if available.
+        :param apply_weights_to_full_year: If True (default), `representative_weights` are
+                                            treated as relative values only. GTEP scales
+                                            them so the representative periods cover one
+                                            full year (`hours_per_year` hours), i.e., so
+                                            that sum(weight * duration_representative_period)
+                                            = hours_per_year. For example, two 24-hour periods with
+                                            weights 1 and 1 each get a weight of 182.5;
+                                            with weights 2 and 1 they get 243.33 and
+                                            121.67. If False, `representative_weights`
+                                            are used directly as the number of times each
+                                            period occurs per year and are not checked.
+                                            If no weights are passed, each period gets a
+                                            weight of 1 before any scaling.
+        :param hours_per_year:          Number of hours in the full year that the
+                                            weights are scaled to when
+                                            `apply_weights_to_full_year` is True.
+                                            Defaults to 8760. Not used when
+                                            `apply_weights_to_full_year` is False.
 
         :type data_path:                Path | str
         :type representative_dates:     list | None, optional
-        :type representative_weights:   list | None, optional
+        :type representative_weights:   dict | None, optional
         :type options_dict:             dict, optional
+        :type apply_weights_to_full_year: bool, optional
+        :type hours_per_year:           float, optional
         """
+        # GTEP currently reads time-series data by commitment-period
+        # index (one hourly data point per commitment period), so the
+        # number of commitment periods must equal the representative
+        # period duration in hours.
+        # [TODO: Remove this restriction once time-series data are
+        # mapped to commitment/dispatch periods by time offset.]
+        if self.period_structure_json_file is None and (
+            self.num_commit != self.duration_representative_period
+        ):
+            raise ValueError(
+                "The number of commitment periods (num_commit="
+                f"{self.num_commit}) must equal the representative period "
+                "duration in hours (duration_representative_period="
+                f"{self.duration_representative_period}). GTEP currently "
+                "requires one-hour commitment periods because time-series "
+                "data are indexed by commitment period."
+            )
+        if self.num_dispatch != 1: 
+            raise ValueError(
+                "GTEP currently only supports the number of dispatch periods "
+                "being equal to the number of commitment periods. Any value "
+                ">1 results in meaningless dispatch periods."
+            )
         self.data_type = "prescient"
 
         # Create prescient config object with defaults
@@ -154,15 +199,34 @@ class ExpansionPlanningData:
         metadata_path = os.path.join(data_path, "simulation_objects.csv")
         metadata_df = pd.read_csv(metadata_path, index_col=0)
 
-        # Save to variable for easy calling
-        sced_freq_min = prescient_options.sced_frequency_minutes
+        # GTEP currently assumes hourly input data. Warn if either
+        # time series in simulation_objects.csv has a different
+        # resolution (in seconds).
+        for sim_type in ("DAY_AHEAD", "REAL_TIME"):
+            resolution_sec = int(metadata_df.loc["Period_Resolution"][sim_type])
+            if resolution_sec != 3600:
+                logger.warning(
+                    f"Period_Resolution for {sim_type} in simulation_objects.csv "
+                    f"is {resolution_sec} seconds, but GTEP currently assumes "
+                    "hourly (3600 second) data. Time-series values may not "
+                    "line up with commitment periods as expected."
+                )
 
-        # This step is grabbing DAY_AHEAD information for now (in the
-        # future we may want to update to grab the "REAL_TIME" data if
-        # the data has reliable data since the actuals model is
-        # looking for real time data info)
-        period_per_step = int(metadata_df.loc["Periods_per_Step"]["DAY_AHEAD"])
-        total_num_steps = prescient_options.num_days * period_per_step
+        # Save to variable for easy calling. Note that Prescient
+        # loads the REAL_TIME (actuals) series at this frequency.
+        sced_freq_min = prescient_options.sced_frequency_minutes
+        if sced_freq_min != 60:
+            logger.warning(
+                f"sced_frequency_minutes is {sced_freq_min}, but GTEP currently "
+                "assumes hourly (60 minute) data steps."
+            )
+
+        # Number of data steps to load and the number of steps in
+        # each representative period. These come from num_days and
+        # duration_representative_period, not from
+        # simulation_objects.csv.
+        total_num_steps = int(prescient_options.num_days * 24 * 60 / sced_freq_min)
+        steps_per_rep = int(self.duration_representative_period * 60 / sced_freq_min)
 
         # Populate an egret model data with the basic stuff
         self.md = data_provider.get_initial_actuals_model(
@@ -202,57 +266,68 @@ class ExpansionPlanningData:
 
         self.load_branch_csv(data_path)
 
-        # Get the timestamps in the loaded day-ahead data. Default
-        # representative_dates are selected from this list to ensure
-        # they correspond to valid input data timestamps. if
-        # representative_dates are provided by the user, those values
-        # are used instead.
+        # Get the timestamps in the loaded data. Representative
+        # periods must start at one of these timestamps.
         time_keys = self.md.data["system"]["time_keys"]
+        time_key_index = {key: idx for idx, key in enumerate(time_keys)}
+
+        def period_fits_in_data(date):
+            """Return True if a representative period of
+            duration_representative_period starting at date lies fully
+            inside the loaded data."""
+            return time_key_index[date] + steps_per_rep <= len(time_keys)
 
         if representative_dates is None:
-            available_day_starts = time_keys[::period_per_step]
-
-            if len(available_day_starts) < self.num_reps:
-                raise ValueError(
-                    "Not enough available day-start timestamps to select default representative dates. Please provide a custom list of representative_dates in the driver or reduce num_reps."
-                )
-
-            # Pick 4 default representative dates from the loaded
-            # data: winter, spring, summer, and fall. If self.num_reps
-            # < 4, use only the first self.num_reps default dates. If
-            # more than 4 representative periods are requested, keep
-            # these 4 defaults and randomly select the remaining dates
-            # from the available day-start timestamps.
+            # Pick 4 default representative dates in the year of the
+            # loaded data: winter, spring, summer, and fall. If
+            # self.num_reps < 4, use only the first self.num_reps
+            # default dates. If more than 4 representative periods are
+            # requested, keep these 4 defaults and randomly select the
+            # remaining dates from the midnight timestamps in the data.
+            data_year = pd.to_datetime(time_keys[0]).year
             default_representative_dates = [
-                available_day_starts[27],  # 2020-01-28
-                available_day_starts[113],  # 2020-04-23
-                available_day_starts[186],  # 2020-07-05
-                available_day_starts[287],  # 2020-10-14
+                f"{data_year}-01-28 00:00",
+                f"{data_year}-04-23 00:00",
+                f"{data_year}-07-05 00:00",
+                f"{data_year}-10-14 00:00",
             ]
 
-            if self.num_reps <= 4:
-                representative_dates = default_representative_dates[: self.num_reps + 1]
+            missing_defaults = [
+                date
+                for date in default_representative_dates
+                if date not in time_key_index
+            ]
+            if missing_defaults:
+                raise ValueError(
+                    "The following default representative dates are not in the "
+                    f"loaded input data: {missing_defaults}. Please provide a "
+                    "custom list of representative_dates."
+                )
+
+            if self.num_reps <= len(default_representative_dates):
+                representative_dates = default_representative_dates[: self.num_reps]
             else:
-                if len(available_day_starts) < self.num_reps:
+                remaining_dates = [
+                    date
+                    for date in time_keys
+                    if date.endswith(" 00:00")
+                    and date not in default_representative_dates
+                    and period_fits_in_data(date)
+                ]
+                num_additional = self.num_reps - len(default_representative_dates)
+                if len(remaining_dates) < num_additional:
                     raise ValueError(
-                        "Not enough available day-start timestamps to select default representative dates. "
-                        "Please provide a custom list of representative_dates in the driver or reduce num_reps."
+                        "Not enough available day-start timestamps to select default "
+                        "representative dates. Please provide a custom list of "
+                        "representative_dates in the driver or reduce num_reps."
                     )
 
                 random_seed = 42
                 rng = random.Random(random_seed)
-                remaining_dates = [
-                    date
-                    for date in available_day_starts
-                    if date not in default_representative_dates
-                ]
-                additional_dates = rng.sample(
-                    remaining_dates,
-                    self.num_reps - len(default_representative_dates),
-                )
+                additional_dates = rng.sample(remaining_dates, num_additional)
                 representative_dates = sorted(
                     default_representative_dates + additional_dates,
-                    key=lambda date: time_keys.index(date),
+                    key=lambda date: time_key_index[date],
                 )
         else:
             # Validate that the user-provided representative_dates
@@ -265,16 +340,29 @@ class ExpansionPlanningData:
                 )
 
             # Validate that all user-provided representative dates
-            # exist in the loaded day-ahead timestamps.
+            # exist in the loaded timestamps.
             missing_dates = [
-                date for date in representative_dates if date not in time_keys
+                date for date in representative_dates if date not in time_key_index
             ]
 
             if missing_dates:
                 raise ValueError(
                     "The following representative_dates are not valid timestamps in the "
-                    f"loaded day-ahead input data: {missing_dates}"
+                    f"loaded input data: {missing_dates}"
                 )
+
+        # Validate that every representative period fits inside the
+        # loaded data.
+        dates_past_end = [
+            date for date in representative_dates if not period_fits_in_data(date)
+        ]
+        if dates_past_end:
+            raise ValueError(
+                "The following representative periods run past the end of the "
+                f"loaded input data ({time_keys[-1]}) for "
+                f"duration_representative_period={self.duration_representative_period} "
+                f"hours: {dates_past_end}"
+            )
 
         self.representative_dates = representative_dates
 
@@ -302,13 +390,6 @@ class ExpansionPlanningData:
                     )
                 )
 
-            total_weight = sum(representative_weights.values())
-            if total_weight != 365:  # leap year...?
-                raise ValueError(
-                    "The values of representative_weights must sum to 365,"
-                    + f" but got {total_weight}"
-                )
-
             logger.info(
                 (
                     "representative_dates and representative_weights are aligned. "
@@ -316,26 +397,48 @@ class ExpansionPlanningData:
                 )
             )
 
-            # Store as a dictionary
-            self.representative_weights_dict = representative_weights
+            input_weights = {
+                date: representative_weights[date] for date in representative_dates
+            }
 
         else:
+            # Default to equal weights for each representative period.
+            input_weights = {date: 1 for date in representative_dates}
 
-            # Set weight for each representative day to default value
-            # of 1. The other option is to set the weight for each day
-            # to the total weight divided by the number of
-            # representative dates.
-            set_default_weight = True
-            if set_default_weight:
-                weight_per_date = 1
-            else:
-                total_weight = prescient_options.num_days * self.stages
-                weight_per_date = int(total_weight / len(representative_dates))
+        if apply_weights_to_full_year:
+            # Treat the input weights as relative values and scale
+            # them so that the representative periods cover one full
+            # year: sum(weight * duration) = hours_per_year.
+            if hours_per_year <= 0:
+                raise ValueError(
+                    f"hours_per_year must be positive, but got {hours_per_year}"
+                )
 
-            # Store weights as a dictionary by representative date
-            self.representative_weights_dict = {
-                date: weight_per_date for date in self.representative_dates
+            nonpositive = {
+                date: weight for date, weight in input_weights.items() if weight <= 0
             }
+            if nonpositive:
+                raise ValueError(
+                    "representative_weights must be positive when "
+                    f"apply_weights_to_full_year=True, but got {nonpositive}"
+                )
+
+            hours_represented = (
+                sum(input_weights.values()) * self.duration_representative_period
+            )
+            scaling_factor = hours_per_year / hours_represented
+            self.representative_weights_dict = {
+                date: weight * scaling_factor for date, weight in input_weights.items()
+            }
+
+            logger.info(
+                "Scaled representative weights to cover a full year "
+                f"({hours_per_year} hours): {self.representative_weights_dict}"
+            )
+        else:
+            # Use the input weights directly as the number of times
+            # each representative period occurs per year.
+            self.representative_weights_dict = input_weights
 
         # Read average heat rates from the "HR_avg_0" column in
         # gen.csv and assign them to each generator in self.md. This
@@ -414,7 +517,7 @@ class ExpansionPlanningData:
         time_keys = self.md.data["system"]["time_keys"]
         for date in self.representative_dates:
             key_idx = time_keys.index(date)
-            time_key_set = time_keys[key_idx : key_idx + period_per_step]
+            time_key_set = time_keys[key_idx : key_idx + steps_per_rep]
             data_list.append(self.md.clone_at_time_keys(time_key_set))
 
         self.representative_data = data_list

@@ -79,6 +79,7 @@ def create_data(
         num_reps=1,
         num_commit=1,
         num_dispatch=1,
+        duration_representative_period=1,
     )
 
     for arg, val in default_data_planning_args.items():

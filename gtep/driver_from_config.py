@@ -114,6 +114,14 @@ def main(config_path):
             "representative_weights"
         ]
 
+    if "apply_weights_to_full_year" in data_config:
+        load_prescient_kwargs["apply_weights_to_full_year"] = data_config[
+            "apply_weights_to_full_year"
+        ]
+
+    if "hours_per_year" in data_config:
+        load_prescient_kwargs["hours_per_year"] = data_config["hours_per_year"]
+
     if "start_date" in data_config:
         load_prescient_kwargs["start_date"] = data_config["start_date"]
 

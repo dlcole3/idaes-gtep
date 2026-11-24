@@ -18,6 +18,7 @@ from pathlib import Path
 import pyomo.common.unittest as unittest
 
 from gtep.gtep_data import ExpansionPlanningData
+from gtep.utils import check_commitment_periods_match_duration
 
 curr_dir = Path(__file__).resolve().parent
 input_data_source = (curr_dir / ".." / ".." / "data" / "5bus").resolve()
@@ -212,6 +213,224 @@ class TestExpansionPlanningData(unittest.TestCase):
                     self.assertEqual(
                         len(p_max["values"]), testObject.duration_representative_period
                     )
+
+
+    def test_weights_scaled_to_full_year_proportional(self):
+        # Relative weights of 2 and 1 should keep their ratio while
+        # covering 8760 hours in total.
+        testObject = ExpansionPlanningData(
+            num_reps=2,
+            num_commit=24,
+            num_dispatch=1,
+            duration_representative_period=24,
+        )
+        testObject.load_prescient(
+            data_path=input_data_source,
+            representative_dates=["2020-01-28 00:00", "2020-07-05 00:00"],
+            representative_weights={"2020-01-28 00:00": 2, "2020-07-05 00:00": 1},
+        )
+
+        weights = testObject.representative_weights_dict
+        self.assertAlmostEqual(weights["2020-01-28 00:00"], 243.333333, places=5)
+        self.assertAlmostEqual(weights["2020-07-05 00:00"], 121.666667, places=5)
+        self.assertAlmostEqual(sum(weights.values()) * 24, 8760)
+
+    def test_weights_scaled_to_full_year_weekly_periods(self):
+        # Equal relative weights on two 168-hour periods should each
+        # cover half of the 8760 hours in a year.
+        testObject = ExpansionPlanningData(
+            num_reps=2,
+            num_commit=168,
+            num_dispatch=1,
+            duration_representative_period=168,
+        )
+        testObject.load_prescient(
+            data_path=input_data_source,
+            representative_dates=["2020-01-28 00:00", "2020-07-05 00:00"],
+            representative_weights={"2020-01-28 00:00": 1, "2020-07-05 00:00": 1},
+        )
+
+        self.assertAlmostEqual(
+            testObject.representative_weights_dict["2020-01-28 00:00"],
+            26.071428571,
+            places=6,
+        )
+        self.assertAlmostEqual(
+            testObject.representative_weights_dict["2020-07-05 00:00"],
+            26.071428571,
+            places=6,
+        )
+
+        # Each representative data object should hold one week of
+        # hourly time keys.
+        for rep_md in testObject.representative_data:
+            self.assertEqual(len(rep_md.data["system"]["time_keys"]), 168)
+
+    def test_default_weights_scaled_to_full_year(self):
+        # With no weights passed, the four default 24-hour periods
+        # should share the year equally.
+        testObject = ExpansionPlanningData(
+            num_reps=4,
+            num_commit=24,
+            num_dispatch=1,
+            duration_representative_period=24,
+        )
+        testObject.load_prescient(data_path=input_data_source)
+
+        for weight in testObject.representative_weights_dict.values():
+            self.assertAlmostEqual(weight, 91.25)
+
+    def test_weights_scaled_to_custom_hours_per_year(self):
+        # Equal relative weights on two 24-hour periods in a leap
+        # year (8784 hours) should each be scaled to 183 days.
+        testObject = ExpansionPlanningData(
+            num_reps=2,
+            num_commit=24,
+            num_dispatch=1,
+            duration_representative_period=24,
+        )
+        testObject.load_prescient(
+            data_path=input_data_source,
+            representative_dates=["2020-01-28 00:00", "2020-07-05 00:00"],
+            representative_weights={"2020-01-28 00:00": 1, "2020-07-05 00:00": 1},
+            hours_per_year=8784,
+        )
+
+        self.assertAlmostEqual(
+            testObject.representative_weights_dict["2020-01-28 00:00"], 183
+        )
+        self.assertAlmostEqual(
+            testObject.representative_weights_dict["2020-07-05 00:00"], 183
+        )
+
+    def test_weights_used_directly(self):
+        # With apply_weights_to_full_year=False, the user weights are
+        # used as given.
+        testObject = ExpansionPlanningData(
+            num_reps=2,
+            num_commit=24,
+            num_dispatch=1,
+            duration_representative_period=24,
+        )
+        testObject.load_prescient(
+            data_path=input_data_source,
+            representative_dates=["2020-01-28 00:00", "2020-07-05 00:00"],
+            representative_weights={"2020-01-28 00:00": 3, "2020-07-05 00:00": 7},
+            apply_weights_to_full_year=False,
+        )
+        self.assertEqual(
+            testObject.representative_weights_dict,
+            {"2020-01-28 00:00": 3, "2020-07-05 00:00": 7},
+        )
+
+        # With no weights passed, each period gets a weight of 1.
+        testObject = ExpansionPlanningData(
+            num_reps=2,
+            num_commit=24,
+            num_dispatch=1,
+            duration_representative_period=24,
+        )
+        testObject.load_prescient(
+            data_path=input_data_source,
+            representative_dates=["2020-01-28 00:00", "2020-07-05 00:00"],
+            apply_weights_to_full_year=False,
+        )
+        self.assertEqual(
+            testObject.representative_weights_dict,
+            {"2020-01-28 00:00": 1, "2020-07-05 00:00": 1},
+        )
+
+    def test_nonpositive_weights_raise_when_scaling(self):
+        testObject = ExpansionPlanningData(
+            num_reps=2,
+            num_commit=24,
+            num_dispatch=1,
+            duration_representative_period=24,
+        )
+        with self.assertRaises(ValueError):
+            testObject.load_prescient(
+                data_path=input_data_source,
+                representative_dates=["2020-01-28 00:00", "2020-07-05 00:00"],
+                representative_weights={
+                    "2020-01-28 00:00": 1,
+                    "2020-07-05 00:00": 0,
+                },
+            )
+
+    def test_num_commit_not_equal_duration_raises(self):
+        # Commitment periods must currently be one hour long.
+        testObject = ExpansionPlanningData(
+            num_reps=2,
+            num_commit=6,
+            num_dispatch=1,
+            duration_representative_period=2,
+        )
+        with self.assertRaises(ValueError) as cm:
+            testObject.load_prescient(
+                data_path=input_data_source,
+                representative_dates=["2020-01-28 00:00", "2020-07-05 00:00"],
+            )
+        self.assertIn("must equal the representative period duration", str(cm.exception))
+
+    def test_check_commitment_periods_match_duration(self):
+        # A period structure with 12-hour commitment periods should
+        # be rejected.
+        period_dict = {
+            "number_representative": 2,
+            "number_commitment": {1: 24, 2: 2},
+            "duration_representative_period": {1: 24, 2: 24},
+        }
+        with self.assertRaises(ValueError) as cm:
+            check_commitment_periods_match_duration(period_dict)
+        self.assertIn("Representative period 2", str(cm.exception))
+        self.assertNotIn("Representative period 1", str(cm.exception))
+
+        # A period structure with one-hour commitment periods should
+        # pass.
+        period_dict = {
+            "number_representative": 2,
+            "number_commitment": {1: 24, 2: 168},
+            "duration_representative_period": {1: 24, 2: 168},
+        }
+        check_commitment_periods_match_duration(period_dict)
+
+    
+    def test_representative_period_past_end_of_data_raises(self):
+        # A one-week period starting December 28 runs past the end of
+        # the loaded data.
+        testObject = ExpansionPlanningData(
+            num_reps=2,
+            num_commit=168,
+            num_dispatch=1,
+            duration_representative_period=168,
+        )
+        with self.assertRaises(ValueError) as cm:
+            testObject.load_prescient(
+                data_path=input_data_source,
+                representative_dates=["2020-01-28 00:00", "2020-12-28 00:00"],
+            )
+        self.assertIn("run past the end", str(cm.exception))
+
+    def test_period_resolution_warning(self):
+        # The 5bus REAL_TIME data has a 300 second resolution, so a
+        # warning should be logged.
+        testObject = ExpansionPlanningData(
+            num_reps=2,
+            num_commit=24,
+            num_dispatch=1,
+            duration_representative_period=24,
+        )
+        with self.assertLogs("gtep.gtep_data", level="WARNING") as cm:
+            testObject.load_prescient(
+                data_path=input_data_source,
+                representative_dates=["2020-01-28 00:00", "2020-07-05 00:00"],
+            )
+        self.assertTrue(
+            any("Period_Resolution for REAL_TIME" in msg for msg in cm.output)
+        )
+        self.assertFalse(
+            any("Period_Resolution for DAY_AHEAD" in msg for msg in cm.output)
+        )
 
     def test_import_load_scaling_normal(self):
         # Test successful passthrough of load scaling function.

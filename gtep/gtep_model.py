@@ -57,6 +57,7 @@ from gtep.utils import (
     generate_period_structure_dict,
     load_period_structure_from_json,
     check_period_structure_consistency,
+    check_commitment_periods_match_duration,
 )
 
 logger = logging.getLogger("gtep.gtep_model")
@@ -140,6 +141,10 @@ class ExpansionPlanningModel:
         # Run a consistency check on commitment and dispatch
         # durations.
         check_period_structure_consistency(period_dict)
+
+        # Commitment periods must currently be one hour long (also
+        # covers period structures loaded from a .json file).
+        check_commitment_periods_match_duration(period_dict)
 
         # Assign period structure attributes from the dictionary
         self.num_reps = period_dict["number_representative"]
